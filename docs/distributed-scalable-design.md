@@ -146,7 +146,70 @@ Source: `docs/diagrams/kafka-partition-routing-ordering.mmd`
 
 Source: `docs/diagrams/distributed-reservation-sequence.mmd`
 
-## 5) Expiry Mechanics in Distributed Mode
+## 5) Redis Patterns for Distributed Coordination
+
+Redis is useful here as a fast coordination layer, but it is not the final source of correctness. Keep `expectedVersion` at the durable event-store boundary as the last write guard.
+
+### Where Redis Helps
+
+- Distributed per-item lock coordination across API/worker nodes.
+- Idempotency key cache for quick duplicate detection.
+- Short-lived counters and hot-path throttling.
+- Lightweight leader election for singleton-like background tasks.
+
+### Recommended Lock Pattern
+
+- Acquire lock with bounded TTL:
+  - `SET lock:{itemId} token NX PX ttlMs`
+- Release lock with Lua compare-and-delete (delete only if token matches owner).
+- Renew lock with heartbeat only by lock owner token.
+- Pair lock with fencing token:
+  - increment a monotonic counter and pass fencing value to downstream write path.
+  - reject stale fencing values at durable write boundary.
+
+### What Not To Do
+
+- Do not `DEL lockKey` blindly without token ownership check.
+- Do not use unbounded or very long lock TTL values.
+- Do not trust Redis lock alone for correctness under split-brain/network faults.
+- Do not skip optimistic concurrency (`expectedVersion`) in event store.
+
+### Failure Semantics and Fallback
+
+- If Redis is unavailable:
+  - Fail closed for high-risk writes, or
+  - route all writes through Kafka partition workers and rely on stream ordering + `expectedVersion`.
+- If lock expires mid-flight:
+  - downstream write must still be protected by `expectedVersion`/fencing checks.
+- If duplicate command processing occurs:
+  - idempotency key + event ID dedupe ensures safe replay behavior.
+
+### Decision Guidance: Kafka vs Redis vs Hybrid
+
+- **Kafka partitioning only**
+  - Strong per-key ordering if all writes go through partitioned workers.
+  - Better as a core write serialization mechanism.
+- **Redis lock only**
+  - Fast coordination but weaker alone under partitions/failover edge cases.
+  - Not sufficient as sole correctness boundary.
+- **Hybrid (Kafka + Redis + expectedVersion)**
+  - Best operational profile for bursty workloads.
+  - Redis reduces hot-key contention and duplicate work.
+  - Kafka + `expectedVersion` preserve correctness when coordination degrades.
+
+### Diagram: Redis Lock Lifecycle
+
+![Redis Lock Lifecycle](./diagrams/redis-lock-lifecycle.svg)
+
+Source: `docs/diagrams/redis-lock-lifecycle.mmd`
+
+### Diagram: Hybrid Consistency Boundary
+
+![Hybrid Consistency Boundary](./diagrams/hybrid-consistency-boundary.svg)
+
+Source: `docs/diagrams/hybrid-consistency-boundary.mmd`
+
+## 6) Expiry Mechanics in Distributed Mode
 
 ### Approach
 
@@ -162,7 +225,7 @@ Source: `docs/diagrams/distributed-reservation-sequence.mmd`
 
 Source: `docs/diagrams/expiry-state-idempotence.mmd`
 
-## 6) Phased Upgrade Roadmap
+## 7) Phased Upgrade Roadmap
 
 ### Phase 1: Durability and Concurrency Contract
 
@@ -194,7 +257,7 @@ Source: `docs/diagrams/expiry-state-idempotence.mmd`
   - Rebuild read model from events.
   - Detect and repair projection drift.
 
-## 7) Observability and Runbook Checks
+## 8) Observability and Runbook Checks
 
 Track the following at minimum:
 
@@ -202,6 +265,8 @@ Track the following at minimum:
 - Append conflict retry rate by stream and item.
 - Partition lag and rebalance frequency.
 - Projection lag and DLQ message rate.
+- Redis lock acquisition failure rate, lock wait time, and lock timeout rate.
+- Redis hot-key concentration and command latency percentiles.
 - Invariant checks:
   - `active + confirmed <= total` per item.
   - Duplicate confirm events for same reservation should be zero.
@@ -214,7 +279,46 @@ If an invariant alert fires:
 4. Repair projection and replay any missed events.
 5. Re-enable writes after consistency checks pass.
 
-## 8) Decision Summary
+## 9) Glossary of Terms
+
+- **Idempotent**: Executing the same operation multiple times yields the same final state. For this project: retries of reserve/confirm/expire must not create duplicate state changes.
+- **Idempotant (alias)**: Common misspelling of idempotent; same intended concept. For this project: treat `idempotant` requests as idempotent behavior requirements.
+- **expectedVersion**: Optimistic concurrency guard requiring stream version match before append. For this project: last-line defense against double-write races.
+- **durableStore**: Storage that survives crashes/restarts and preserves committed state. For this project: event store and idempotency records must be durable.
+- **DLQ (Dead Letter Queue)**: Queue/topic for messages that repeatedly fail normal processing. For this project: poison commands/events move to `reservation.dlq` with replay runbook.
+- **Partition**: Ordered subset of a Kafka topic. For this project: route by `itemId` so each item has deterministic command order.
+- **Partition key**: Value used to choose partition placement. For this project: `itemId` is the command key.
+- **Consumer group**: Set of consumers sharing partitions for parallel processing. For this project: command and projection workers scale horizontally via group membership.
+- **Offset**: Position of a record inside a partition. For this project: commit offsets only after durable state transition completion.
+- **Replay**: Reprocessing historical events/messages from earlier offsets. For this project: used for recovery, backfill, and projection rebuilds.
+- **Outbox pattern**: Persist event + publish intent atomically, then deliver asynchronously. For this project: prevents dual-write gaps between DB append and Kafka publish.
+- **Projection**: Read-model state derived from ordered domain events. For this project: query paths should read projection, not raw event streams.
+- **Projection lag**: Delay between event commit and projection availability. For this project: monitor lag to control stale read behavior.
+- **Poison message**: Message that consistently fails due to bad payload/logic incompatibility. For this project: route to DLQ after bounded retries.
+- **Rebalance**: Kafka partition reassignment when consumers join/leave/fail. For this project: handlers must be idempotent during ownership handoff.
+- **Linearizability**: Operations appear to occur atomically in real-time order. For this project: per-item linearizable semantics are the target for writes.
+- **Eventual consistency**: Reads may lag writes but converge over time. For this project: projection reads can be slightly stale after command acceptance.
+- **At-least-once delivery**: Messages may be delivered more than once. For this project: dedupe by event ID/idempotency key is required.
+- **Exactly-once semantics**: System effect appears once despite retries/duplicates. For this project: approximated with idempotency + transactional boundaries.
+- **Stream version**: Monotonic version number for a stream after each append. For this project: base value checked by `expectedVersion`.
+- **Conflict retry**: Retrying command after optimistic concurrency conflict. For this project: use bounded retries with jitter and metrics.
+- **Event ID**: Unique identifier per domain event. For this project: used for dedupe in projections and downstream consumers.
+- **Command ID**: Unique identifier for command/request execution intent. For this project: used to enforce idempotent command handling.
+- **Fencing token**: Monotonic token proving freshest lock ownership. For this project: stale lock holders must be rejected at write boundary.
+- **Lock TTL**: Maximum lock lifetime before auto-expiration. For this project: keep TTL short and renew only while owner is healthy.
+- **SET NX PX**: Redis atomic lock acquire primitive (`NX` no overwrite, `PX` TTL in ms). For this project: base primitive for distributed lock attempt.
+- **Lua compare-and-delete**: Redis script that deletes lock only if token matches owner. For this project: required for safe lock release.
+- **Single-flight**: Coalescing identical in-flight work to avoid duplicate processing. For this project: reduce duplicate reserve attempts for same key.
+- **Hot key**: Disproportionately accessed key causing contention. For this project: popular `itemId` values may need adaptive backoff/sharding.
+- **Redlock**: Multi-node Redis locking algorithm for higher availability; debated safety under some failure models. For this project: use cautiously, never without downstream concurrency guards.
+- **Write amplification**: One logical action causes multiple storage/queue writes. For this project: monitor event + outbox + projection fanout costs.
+- **Backpressure**: Controlled slowdown when downstream is saturated. For this project: workers should pause intake when lag or store latency spikes.
+- **Jittered backoff**: Retry delay with randomness to avoid synchronized retry storms. For this project: mandatory for conflict and transient retry loops.
+- **Quorum**: Minimum replica agreement required for operation success. For this project: Kafka ISR and Redis topology choices affect durability guarantees.
+- **Split-brain**: Partitioned cluster state where multiple nodes think they are primary. For this project: never rely on coordination layer alone for correctness.
+- **Leader election**: Selecting a single active worker for singleton tasks. For this project: can be Redis-assisted, but task side effects must remain idempotent.
+
+## 10) Decision Summary
 
 - Keep event-sourced domain model and invariants.
 - Move from in-process locking to partitioned command serialization by `itemId`.

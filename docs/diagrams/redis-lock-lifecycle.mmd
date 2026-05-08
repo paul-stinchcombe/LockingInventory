@@ -1,0 +1,13 @@
+flowchart TD
+  requestIn["Write request for itemId"] --> acquireLock["SET lock:itemId token NX PX ttlMs"]
+  acquireLock -->|"lock acquired"| processCmd["Process command and business rules"]
+  acquireLock -->|"lock denied"| retryPath["Backoff with jitter and retry"]
+  retryPath --> acquireLock
+  processCmd --> heartbeat["Renew lock TTL with owner token"]
+  heartbeat --> appendGuard["Append with expectedVersion and fencingToken"]
+  appendGuard -->|"append conflict"| conflictRetry["Reload stream and retry bounded times"]
+  conflictRetry --> processCmd
+  appendGuard -->|"append success"| releaseLock["Lua compare and delete lock if token matches"]
+  releaseLock --> successOut["Success response and ack"]
+  processCmd --> ownerLost["Lock expired or owner lost"]
+  ownerLost --> safeFail["Stop processing and rely on expectedVersion to reject stale write"]

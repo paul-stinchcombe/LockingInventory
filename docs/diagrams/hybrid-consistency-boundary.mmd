@@ -1,0 +1,15 @@
+flowchart LR
+  apiNode["API or worker node"] --> idemCheck["Check idempotencyKey in durable table or Redis cache"]
+  idemCheck -->|"duplicate key"| cachedResult["Return prior result"]
+  idemCheck -->|"new key"| redisLock["Acquire Redis lock SET NX PX"]
+  redisLock -->|"acquired"| streamLoad["Load stream and currentVersion"]
+  redisLock -->|"not acquired"| waitRetry["Retry with jitter or route through Kafka worker"]
+  waitRetry --> redisLock
+  streamLoad --> writeAttempt["Append events with expectedVersion and fencingToken"]
+  writeAttempt -->|"version mismatch"| reloadRetry["Reload stream and retry bounded"]
+  reloadRetry --> streamLoad
+  writeAttempt -->|"success"| outboxWrite["Write outbox or publish event atomically"]
+  outboxWrite --> projectionApply["Projection consumer apply event idempotently"]
+  projectionApply --> readModel["Read model updated"]
+  outboxWrite --> releasePath["Release Redis lock via Lua token check"]
+  releasePath --> responseOut["Return success"]
